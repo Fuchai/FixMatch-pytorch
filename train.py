@@ -8,6 +8,8 @@ from collections import OrderedDict
 from copy import deepcopy
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.backends import cudnn
 from torch.optim.lr_scheduler import LambdaLR
@@ -20,6 +22,10 @@ from fixmatch.dataset.cifar import get_cifar10, get_cifar100
 from fixmatch.models.confucius_model import *
 from fixmatch.utils import AverageMeter, accuracy
 from logger import Logger
+from dataset.cifar import DATASET_GETTERS
+
+logger = logging.getLogger(__name__)
+best_acc = 0
 
 
 def save_checkpoint(state, is_best, checkpoint, filename='checkpoint.pth.tar'):
@@ -34,7 +40,6 @@ def set_seed(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
@@ -54,6 +59,16 @@ def get_cosine_schedule_with_warmup(optimizer,
     return LambdaLR(optimizer, _lr_lambda, last_epoch)
 
 
+def interleave(x, size):
+    s = list(x.shape)
+    return x.reshape([-1, size] + s[1:]).transpose(0, 1).reshape([-1] + s[1:])
+
+
+def de_interleave(x, size):
+    s = list(x.shape)
+    return x.reshape([size, -1] + s[1:]).transpose(0, 1).reshape([-1] + s[1:])
+
+
 def main():
     parser = argparse.ArgumentParser(description='PyTorch FixMatch Training')
     parser.add_argument('--set', default='default', type=str)
@@ -67,6 +82,8 @@ def main():
                         help='dataset name')
     parser.add_argument('--num-labeled', type=int, default=4000,
                         help='number of labeled data')
+    parser.add_argument("--expand-labels", action="store_true",
+                        help="expand labels to fit eval steps")
     parser.add_argument('--arch', default='wideresnet', type=str,
                         choices=['wideresnet', 'resnext'],
                         help='dataset name')
@@ -99,8 +116,8 @@ def main():
                         help='number of labeled examples')
     parser.add_argument('--resume', default='', type=str,
                         help='path to latest checkpoint (default: none)')
-    parser.add_argument('--seed', type=int, default=-1,
-                        help="random seed (-1: don't use random seed)")
+    parser.add_argument('--seed', default=None, type=int,
+                        help="random seed")
     parser.add_argument("--amp", action="store_true",
                         help="use 16-bit (mixed) precision through NVIDIA apex AMP")
     parser.add_argument("--opt_level", type=str, default="O1",
@@ -181,7 +198,7 @@ def main():
 
     logger.log_print(dict(args._get_kwargs()))
 
-    if args.seed != -1:
+    if args.seed is not None:
         set_seed(args)
 
     if args.local_rank in [-1, 0]:
@@ -199,10 +216,18 @@ def main():
 
     model = create_model(args)
 
-    if args.local_rank == 0:
-        torch.distributed.barrier()
+    elif args.dataset == 'cifar100':
+        args.num_classes = 100
+        if args.arch == 'wideresnet':
+            args.model_depth = 28
+            args.model_width = 8
+        elif args.arch == 'resnext':
+            args.model_cardinality = 8
+            args.model_depth = 29
+            args.model_width = 64
 
-    model.to(args.device)
+    labeled_dataset, unlabeled_dataset, test_dataset = DATASET_GETTERS[args.dataset](
+        args, './data')
 
     confucius = Confucius(10, 128, 32)
     confucius.to(args.device)
@@ -229,21 +254,38 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers)
 
-    optimizer = optim.SGD(model.parameters(), lr=args.lr,
+    if args.local_rank not in [-1, 0]:
+        torch.distributed.barrier()
+
+    model = create_model(args)
+
+    if args.local_rank == 0:
+        torch.distributed.barrier()
+
+    model.to(args.device)
+
+    no_decay = ['bias', 'bn']
+    grouped_parameters = [
+        {'params': [p for n, p in model.named_parameters() if not any(
+            nd in n for nd in no_decay)], 'weight_decay': args.wdecay},
+        {'params': [p for n, p in model.named_parameters() if any(
+            nd in n for nd in no_decay)], 'weight_decay': 0.0}
+    ]
+    optimizer = optim.SGD(grouped_parameters, lr=args.lr,
                           momentum=0.9, nesterov=args.nesterov)
 
-    args.iteration = args.k_img // args.batch_size // args.world_size
-    args.total_steps = args.epochs * args.iteration
+    args.epochs = math.ceil(args.total_steps / args.eval_step)
     scheduler = get_cosine_schedule_with_warmup(
-        optimizer, args.warmup * args.iteration, args.total_steps)
+        optimizer, args.warmup, args.total_steps)
 
     confucius_optim = optim.Adam(confucius.parameters())
     # no scheduler. not sure if SGD is the matter, Adam needs no scheduler # TODO ablation
 
     if args.use_ema:
-        ema_model = ModelEMA(args, model, args.ema_decay, device)
+        from models.ema import ModelEMA
+        ema_model = ModelEMA(args, model, args.ema_decay)
 
-    start_epoch = 0
+    args.start_epoch = 0
 
     if args.resume:
         logger.log_print("==> Resuming from checkpoint..")
@@ -252,7 +294,7 @@ def main():
         args.out = os.path.dirname(args.resume)
         checkpoint = torch.load(args.resume)
         best_acc = checkpoint['best_acc']
-        start_epoch = checkpoint['epoch']
+        args.start_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
         if args.use_ema:
             ema_model.ema.load_state_dict(checkpoint['ema_state_dict'])
@@ -277,7 +319,6 @@ def main():
         f"  Total train batch size = {args.batch_size * args.world_size}")
     logger.log_print(f"  Total optimization steps = {args.total_steps}")
 
-    test_accs = []
     model.zero_grad()
     model = nn.DataParallel(model)
     confucius = nn.DataParallel(confucius)
@@ -305,9 +346,9 @@ def main():
 
 
 
-        is_best = test_acc > best_acc
-        best_acc = max(test_acc, best_acc)
-        if args.local_rank in [-1, 0]:
+            is_best = test_acc > best_acc
+            best_acc = max(test_acc, best_acc)
+
             model_to_save = model.module if hasattr(model, "module") else model
             if args.use_ema:
                 ema_to_save = ema_model.ema.module if hasattr(
@@ -545,50 +586,5 @@ def ttest(args, test_loader, model, epoch, logger):
             test_loader.close()
     return losses.avg, top1.avg, top5.avg
 
-class ModelEMA(object):
-    def __init__(self, args, model, decay, device='', resume=''):
-        self.ema = deepcopy(model)
-        self.ema.eval()
-        self.decay = decay
-        self.device = device
-        self.wd = args.lr * args.wdecay
-        if device:
-            self.ema.to(device=device)
-        self.ema_has_module = hasattr(self.ema, 'module')
-        if resume:
-            self._load_checkpoint(resume)
-        for p in self.ema.parameters():
-            p.requires_grad_(False)
-
-    def _load_checkpoint(self, checkpoint_path):
-        checkpoint = torch.load(checkpoint_path)
-        assert isinstance(checkpoint, dict)
-        if 'ema_state_dict' in checkpoint:
-            new_state_dict = OrderedDict()
-            for k, v in checkpoint['ema_state_dict'].items():
-                if self.ema_has_module:
-                    name = 'module.' + k if not k.startswith('module') else k
-                else:
-                    name = k
-                new_state_dict[name] = v
-            self.ema.load_state_dict(new_state_dict)
-
-    def update(self, model):
-        needs_module = hasattr(model, 'module') and not self.ema_has_module
-        with torch.no_grad():
-            msd = model.state_dict()
-            for k, ema_v in self.ema.state_dict().items():
-                if needs_module:
-                    k = 'module.' + k
-                model_v = msd[k].detach()
-                if self.device:
-                    model_v = model_v.to(device=self.device)
-                ema_v.copy_(ema_v * self.decay + (1. - self.decay) * model_v)
-                # weight decay
-                if 'bn' not in k:
-                    msd[k] = msd[k] * (1. - self.wd)
-
-
 if __name__ == '__main__':
-    cudnn.benchmark = True
     main()

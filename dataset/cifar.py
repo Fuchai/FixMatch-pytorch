@@ -1,4 +1,5 @@
 import logging
+import math
 
 import numpy as np
 from PIL import Image
@@ -17,7 +18,7 @@ normal_mean = (0.5, 0.5, 0.5)
 normal_std = (0.5, 0.5, 0.5)
 
 
-def get_cifar10(root, num_labeled, num_expand_x, num_expand_u):
+def get_cifar10(args, root):
     transform_labeled = transforms.Compose([
         transforms.RandomHorizontalFlip(),
         transforms.RandomCrop(size=32,
@@ -33,7 +34,7 @@ def get_cifar10(root, num_labeled, num_expand_x, num_expand_u):
     base_dataset = datasets.CIFAR10(root, train=True, download=True)
 
     train_labeled_idxs, train_unlabeled_idxs = x_u_split(
-        base_dataset.targets, num_labeled, num_expand_x, num_expand_u, num_classes=10)
+        args, base_dataset.targets)
 
     train_labeled_dataset = CIFAR10SSL(
         root, train_labeled_idxs, train=True,
@@ -42,18 +43,15 @@ def get_cifar10(root, num_labeled, num_expand_x, num_expand_u):
     # is weak transformation applied on the unlabelled dataset?
     train_unlabeled_dataset = CIFAR10SSL(
         root, train_unlabeled_idxs, train=True,
-        transform=TransformFix(mean=cifar10_mean, std=cifar10_std))
+        transform=TransformFixMatch(mean=cifar10_mean, std=cifar10_std))
 
     test_dataset = datasets.CIFAR10(
         root, train=False, transform=transform_val, download=False)
-    logger.info("Dataset: CIFAR10")
-    logger.info(f"Labeled examples: {len(train_labeled_idxs)}"
-                f" Unlabeled examples: {len(train_unlabeled_idxs)}")
 
     return train_labeled_dataset, train_unlabeled_dataset, test_dataset
 
 
-def get_cifar100(root, num_labeled, num_expand_x, num_expand_u):
+def get_cifar100(args, root):
 
     transform_labeled = transforms.Compose([
         transforms.RandomHorizontalFlip(),
@@ -70,8 +68,8 @@ def get_cifar100(root, num_labeled, num_expand_x, num_expand_u):
     base_dataset = datasets.CIFAR100(
         root, train=True, download=True)
 
-    train_labeled_idxs, train_unlabeled_idxs =x_u_split(
-        base_dataset.targets, num_labeled, num_expand_x, num_expand_u, num_classes=100)
+    train_labeled_idxs, train_unlabeled_idxs = x_u_split(
+        args, base_dataset.targets)
 
     train_labeled_dataset = CIFAR100SSL(
         root, train_labeled_idxs, train=True,
@@ -79,58 +77,36 @@ def get_cifar100(root, num_labeled, num_expand_x, num_expand_u):
 
     train_unlabeled_dataset = CIFAR100SSL(
         root, train_unlabeled_idxs, train=True,
-        transform=TransformFix(mean=cifar100_mean, std=cifar100_std))
+        transform=TransformFixMatch(mean=cifar100_mean, std=cifar100_std))
 
     test_dataset = datasets.CIFAR100(
         root, train=False, transform=transform_val, download=False)
 
-    logger.info("Dataset: CIFAR100")
-    logger.info(f"Labeled examples: {len(train_labeled_idxs)}"
-                f" Unlabeled examples: {len(train_unlabeled_idxs)}")
-
     return train_labeled_dataset, train_unlabeled_dataset, test_dataset
 
 
-def x_u_split(labels,
-              num_labeled,
-              num_expand_x,
-              num_expand_u,
-              num_classes):
-    label_per_class = num_labeled // num_classes
+def x_u_split(args, labels):
+    label_per_class = args.num_labeled // args.num_classes
     labels = np.array(labels)
     labeled_idx = []
-    unlabeled_idx = []
-    for i in range(num_classes):
+    # unlabeled data: all data (https://github.com/kekmodel/FixMatch-pytorch/issues/10)
+    unlabeled_idx = np.array(range(len(labels)))
+    for i in range(args.num_classes):
         idx = np.where(labels == i)[0]
-        np.random.shuffle(idx)
-        labeled_idx.extend(idx[:label_per_class])
-        unlabeled_idx.extend(idx[label_per_class:])
+        idx = np.random.choice(idx, label_per_class, False)
+        labeled_idx.extend(idx)
+    labeled_idx = np.array(labeled_idx)
+    assert len(labeled_idx) == args.num_labeled
 
-    exapand_labeled = num_expand_x // len(labeled_idx)
-    exapand_unlabeled = num_expand_u // len(unlabeled_idx)
-    labeled_idx = np.hstack(
-        [labeled_idx for _ in range(exapand_labeled)])
-    unlabeled_idx = np.hstack(
-        [unlabeled_idx for _ in range(exapand_unlabeled)])
-
-    if len(labeled_idx) < num_expand_x:
-        diff = num_expand_x - len(labeled_idx)
-        labeled_idx = np.hstack(
-            (labeled_idx, np.random.choice(labeled_idx, diff)))
-    else:
-        assert len(labeled_idx) == num_expand_x
-
-    if len(unlabeled_idx) < num_expand_u:
-        diff = num_expand_u - len(unlabeled_idx)
-        unlabeled_idx = np.hstack(
-            (unlabeled_idx, np.random.choice(unlabeled_idx, diff)))
-    else:
-        assert len(unlabeled_idx) == num_expand_u
-
+    if args.expand_labels or args.num_labeled < args.batch_size:
+        num_expand_x = math.ceil(
+            args.batch_size * args.eval_step / args.num_labeled)
+        labeled_idx = np.hstack([labeled_idx for _ in range(num_expand_x)])
+    np.random.shuffle(labeled_idx)
     return labeled_idx, unlabeled_idx
 
 
-class TransformFix(object):
+class TransformFixMatch(object):
     def __init__(self, mean, std):
         self.weak = transforms.Compose([
             transforms.RandomHorizontalFlip(),
@@ -202,3 +178,7 @@ class CIFAR100SSL(datasets.CIFAR100):
             target = self.target_transform(target)
 
         return img, target
+
+
+DATASET_GETTERS = {'cifar10': get_cifar10,
+                   'cifar100': get_cifar100}
