@@ -8,7 +8,7 @@ __pycache__/
 
 # C extensions
 *.so
-
+.idea 
 # Distribution / packaging
 .Python
 build/
@@ -105,3 +105,13 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+.idea/$CACHE_FILE$
+.idea/deployment.xml
+.idea/encodings.xml
+.idea/FixMatch-pytorch.iml
+.idea/inspectionProfiles/profiles_settings.xml
+.idea/inspectionProfiles/Project_Default.xml
+.idea/misc.xml
+.idea/modules.xml
+.idea/remote-mappings.xml
+.idea/vcs.xml

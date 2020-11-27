@@ -39,6 +39,7 @@ def get_cifar10(root, num_labeled, num_expand_x, num_expand_u):
         root, train_labeled_idxs, train=True,
         transform=transform_labeled)
 
+    # is weak transformation applied on the unlabelled dataset?
     train_unlabeled_dataset = CIFAR10SSL(
         root, train_unlabeled_idxs, train=True,
         transform=TransformFix(mean=cifar10_mean, std=cifar10_std))
@@ -147,6 +148,7 @@ class TransformFix(object):
             transforms.Normalize(mean=mean, std=std)])
 
     def __call__(self, x):
+        # TODO do you normalize after the transformation?
         weak = self.weak(x)
         strong = self.strong(x)
         return self.normalize(weak), self.normalize(strong)

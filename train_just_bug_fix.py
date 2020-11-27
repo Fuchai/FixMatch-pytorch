@@ -1,15 +1,18 @@
+from logger import Logger
+
 import argparse
 import math
 import os
 import random
 import shutil
 import time
-from collections import OrderedDict
 from copy import deepcopy
-
+from collections import OrderedDict
 import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.backends import cudnn
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -17,9 +20,12 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from fixmatch.dataset.cifar import get_cifar10, get_cifar100
-from fixmatch.models.confucius_model import *
 from fixmatch.utils import AverageMeter, accuracy
-from logger import Logger
+from fixmatch.models.confucius_model import *
+
+DATASET_GETTERS = {'cifar10': get_cifar10,
+                   'cifar100': get_cifar100}
+best_acc = 0
 
 
 def save_checkpoint(state, is_best, checkpoint, filename='checkpoint.pth.tar'):
@@ -48,19 +54,19 @@ def get_cosine_schedule_with_warmup(optimizer,
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
         no_progress = float(current_step - num_warmup_steps) / \
-                      float(max(1, num_training_steps - num_warmup_steps))
+            float(max(1, num_training_steps - num_warmup_steps))
         return max(0., math.cos(math.pi * num_cycles * no_progress))
 
     return LambdaLR(optimizer, _lr_lambda, last_epoch)
 
 
-def main():
+def main(set_name, version):
+    logger = Logger(set_name, version)
+
     parser = argparse.ArgumentParser(description='PyTorch FixMatch Training')
-    parser.add_argument('--set', default='default', type=str)
-    parser.add_argument('--version', default='0', type=str)
     parser.add_argument('--gpu-id', default='0', type=int,
                         help='id(s) for CUDA_VISIBLE_DEVICES')
-    parser.add_argument('--num-workers', type=int, default=32,
+    parser.add_argument('--num-workers', type=int, default=64,
                         help='number of workers')
     parser.add_argument('--dataset', default='cifar10', type=str,
                         choices=['cifar10', 'cifar100'],
@@ -74,8 +80,7 @@ def main():
                         help='number of total epochs to run')
     parser.add_argument('--start-epoch', default=0, type=int,
                         help='manual epoch number (useful on restarts)')
-    # is this per gpu batch_size? I do not seee data distributed across all 4 cards, guessing from the memory
-    parser.add_argument('--batch-size', default=512, type=int,
+    parser.add_argument('--batch-size', default=128, type=int,
                         help='train batchsize')
     parser.add_argument('--lr', '--learning-rate', default=0.03, type=float,
                         help='initial learning rate')
@@ -97,6 +102,8 @@ def main():
                         help='pseudo label threshold')
     parser.add_argument('--k-img', default=65536, type=int,
                         help='number of labeled examples')
+    parser.add_argument('--out', default=str(logger.exp_dir/'result'),
+                        help='directory to output the result')
     parser.add_argument('--resume', default='', type=str,
                         help='path to latest checkpoint (default: none)')
     parser.add_argument('--seed', type=int, default=-1,
@@ -110,14 +117,9 @@ def main():
                         help="For distributed training: local_rank")
     parser.add_argument('--no-progress', action='store_true', default=True,
                         help="don't use progress bar")
-    parser.add_argument('--no-semi-confucius', action='store_true',
-                        help="train confucius with unlabelled data")
 
     args = parser.parse_args()
-    best_acc = 0
-    logger = Logger(args.set, args.version)
-    args.out = str(logger.exp_dir / 'result')
-    args.semi_confucius=not args.no_semi_confucius
+    global best_acc
 
     def create_model(args):
         if args.arch == 'wideresnet':
@@ -186,13 +188,10 @@ def main():
 
     if args.local_rank in [-1, 0]:
         os.makedirs(args.out, exist_ok=True)
-        logger.make_writer()
+        writer = SummaryWriter(logger.path/"summary")
 
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
-
-    DATASET_GETTERS = {'cifar10': get_cifar10,
-                       'cifar100': get_cifar100}
 
     labeled_dataset, unlabeled_dataset, test_dataset = DATASET_GETTERS[args.dataset](
         '../../data/cifarfm', args.num_labeled, args.k_img, args.k_img * args.mu)
@@ -301,9 +300,21 @@ def main():
         else:
             test_model = model
 
-        test_loss, test_acc, test_acc_5 = ttest(args, test_loader, test_model, 0, logger)
+        test_loss, test_acc = ttest(args, test_loader, test_model, 0, logger)
 
+        if args.local_rank in [-1, 0]:
+            logger.auto_log("train loss", epoch=epoch, iter=len(labeled_trainloader),
+                            loss=train_loss, loss_x=train_loss_x,
+                            loss_u=train_loss_u, mask_prob=mask_prob, epoch_time=epoch_time)
+            logger.auto_log("test loss", epoch=epoch,
+                            accu=test_acc, loss=test_loss)
 
+            writer.add_scalar('train/1.train_loss', train_loss, epoch)
+            writer.add_scalar('train/2.train_loss_x', train_loss_x, epoch)
+            writer.add_scalar('train/3.train_loss_u', train_loss_u, epoch)
+            writer.add_scalar('train/4.mask', mask_prob, epoch)
+            writer.add_scalar('test/1.test_acc', test_acc, epoch)
+            writer.add_scalar('test/2.test_loss', test_loss, epoch)
 
         is_best = test_acc > best_acc
         best_acc = max(test_acc, best_acc)
@@ -313,7 +324,7 @@ def main():
                 ema_to_save = ema_model.ema.module if hasattr(
                     ema_model.ema, "module") else ema_model.ema
             save_checkpoint({
-                'epoch': epoch,
+                'epoch': epoch + 1,
                 'state_dict': model_to_save.state_dict(),
                 'ema_state_dict': ema_to_save.state_dict() if args.use_ema else None,
                 'acc': test_acc,
@@ -323,16 +334,11 @@ def main():
             }, is_best, args.out)
 
         test_accs.append(test_acc)
-        if args.local_rank in [-1, 0]:
-            logger.auto_log("test", tensorboard=True, epoch=epoch,
-                            loss=test_loss, top_1_acc=test_acc, top_5_acc=test_acc_5,
-                            best_top_1=best_acc, mean_top_1=np.mean(test_accs[-20:]))
-            logger.writer.add_scalar('test/1.test_acc', float(test_acc), epoch)
-            logger.writer.add_scalar('test/2.test_loss', float(test_loss), epoch)
-
+        logger.auto_log("test accuracy", epoch=epoch, best_top_1=best_acc,
+                        mean_top_1=np.mean(test_accs[-20:]))
 
     if args.local_rank in [-1, 0]:
-        logger.writer.close()
+        writer.close()
 
 
 def train_one_epoch(args, labeled_trainloader, unlabeled_trainloader,
@@ -344,14 +350,6 @@ def train_one_epoch(args, labeled_trainloader, unlabeled_trainloader,
     losses = AverageMeter()
     losses_x = AverageMeter()
     losses_u = AverageMeter()
-    avg_mask = AverageMeter()
-    avg_mask_conf = AverageMeter()
-    avg_conf_loss = AverageMeter()
-
-
-    avg_true_confidence, avg_false_confidence, avg_true_semi_confidence, avg_false_semi_confidence = \
-        AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter()
-
     end = time.time()
     epoch_start = time.time()
 
@@ -427,78 +425,41 @@ def train_one_epoch(args, labeled_trainloader, unlabeled_trainloader,
         pred = pred.argmax(dim=1, keepdim=True)
         precision = pred.eq(targets_x.view_as(pred)).float()
 
-        x_conf_loss = F.binary_cross_entropy_with_logits(conf_logits_x, precision)
-
-        if args.no_semi_confucius:
-            u_s_conf_loss = 0
-        else:
-            u_s_pred = torch.softmax(logits_u_s.detach(), dim=-1)
-            u_s_pred = u_s_pred.argmax(dim=1, keepdim=True)
-            u_s_accu = u_s_pred.eq(pseudo_label.view_as(u_s_pred)).float()
-            u_s_conf_loss = F.binary_cross_entropy_with_logits(
-                conf_u_s, u_s_accu)
-
-        conf_loss = x_conf_loss + args.lambda_u * u_s_conf_loss
-
+        conf_loss = F.binary_cross_entropy_with_logits(conf_logits_x, precision)
         conf_loss.backward()
-
-        avg_conf_loss.update(conf_loss.item())
-        avg_true_confidence.update(0)
-        avg_false_confidence.update(0)
-        avg_true_semi_confidence.update(0)
-        avg_false_semi_confidence.update(0)
-
         confucius_optim.step()
         model.zero_grad()
         confucius.zero_grad()
 
         batch_time.update(time.time() - end)
         end = time.time()
-        avg_mask.update(mask.mean().item())
+        mask_prob = mask.mean().item()
 
         if not args.no_progress:
             p_bar.set_description(
-                f"Train Epoch: {epoch}/{args.epochs:4}. Iter: {batch_idx:4}/{args.iteration:4}. "
-                f"LR: {scheduler.get_last_lr()[0]:.6f}. Data: {data_time:.3f}s. "
-                f"Batch: {batch_time:.3f}s. Loss: {losses:.4f}. Loss_x: {losses_x:.4f}. \n"
-                f"Loss_u: {losses_u:.4f}. Mask prob: {avg_mask:.4f}. Mask conf: {avg_mask_conf:.4f}."
-                f"Conf loss:{avg_conf_loss:.4f}. True labelled confidence: {avg_true_confidence:4f}. "
-                f"False labelled confidence: {avg_false_confidence:.4f}. True semi confidence: {avg_true_semi_confidence:4.f}."
-                f"False semi confidence: {avg_false_semi_confidence:.4f}.")
-            # .format(
-            # epoch=epoch + 1,
-            # epochs=args.epochs,
-            # batch=batch_idx + 1,
-            # iter=args.iteration,
-            # lr=scheduler.get_last_lr()[0],
-            # data=data_time,
-            # bt=batch_time,
-            # loss=losses,
-            # loss_x=losses_x,
-            # loss_u=losses_u,
-            # mask=mask_prob))
+                "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.6f}. Data: {data:.3f}s. "
+                "Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. "
+                "Loss_u: {loss_u:.4f}. Mask: {mask:.4f}. ".format(
+                    epoch=epoch + 1,
+                    epochs=args.epochs,
+                    batch=batch_idx + 1,
+                    iter=args.iteration,
+                    lr=scheduler.get_last_lr()[0],
+                    data=data_time.avg,
+                    bt=batch_time.avg,
+                    loss=losses.avg,
+                    loss_x=losses_x.avg,
+                    loss_u=losses_u.avg,
+                    mask=mask_prob))
             p_bar.update()
         else:
-            print_intvl = int(len(labeled_trainloader) / 10)
-            if batch_idx % print_intvl == 0 or batch_idx == len(labeled_trainloader)-1:
-                logger.auto_log("train", tensorboard=True, epoch=epoch, iter=batch_idx,
-                                loss=losses, loss_x=losses_x,
-                                loss_u=losses_u, mask_prob=avg_mask, epoch_time=time.time() - epoch_start,
-                                mask_conf=avg_mask_conf, conf_loss=avg_conf_loss,
-                                true_confidence=avg_true_confidence,
-                                false_confidence=avg_false_confidence, true_semi_conf=0,
-                                false_semi_conf =0)
-
+            print_intvl = int(len(labeled_trainloader)/20)
+            if batch_idx % print_intvl == 0:
+                logger.auto_log("train loss", epoch=epoch, iter=batch_idx, loss=losses.avg, loss_x=losses_x.avg,
+                                loss_u=losses_u.avg, mask_prob=mask_prob, epoch_time=time.time()-epoch_start)
     if not args.no_progress:
         p_bar.close()
-
-    if args.local_rank in [-1, 0]:
-        logger.writer.add_scalar('train/1.train_loss', losses.avg, epoch)
-        logger.writer.add_scalar('train/2.train_loss_x', losses_x.avg, epoch)
-        logger.writer.add_scalar('train/3.train_loss_u', losses_u.avg, epoch)
-        logger.writer.add_scalar('train/4.mask', avg_mask.avg, epoch)
-
-    return losses.avg, losses_x.avg, losses_u.avg, avg_mask.avg, time.time() - epoch_start
+    return losses.avg, losses_x.avg, losses_u.avg, mask_prob, time.time()-epoch_start
 
 
 def ttest(args, test_loader, model, epoch, logger):
@@ -543,7 +504,12 @@ def ttest(args, test_loader, model, epoch, logger):
                     ))
         if not args.no_progress:
             test_loader.close()
-    return losses.avg, top1.avg, top5.avg
+    logger.auto_log("top accuracy", epoch=epoch,
+                    top_1_accu=top1.avg, top_5_acc=top5.avg)
+    # logger.log_print("top-1 acc: {:.2f}".format(top1.avg))
+    # logger.log_print("top-5 acc: {:.2f}".format(top5.avg))
+    return losses.avg, top1.avg
+
 
 class ModelEMA(object):
     def __init__(self, args, model, decay, device='', resume=''):

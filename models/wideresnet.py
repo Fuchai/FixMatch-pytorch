@@ -70,10 +70,13 @@ class NetworkBlock(nn.Module):
 
 
 class WideResNet(nn.Module):
-    def __init__(self, num_classes, depth=28, widen_factor=2, drop_rate=0.0):
+    def __init__(self, num_classes, depth=28, widen_factor=2, drop_rate=0.0, expose=0):
         super(WideResNet, self).__init__()
-        channels = [16, 16*widen_factor, 32*widen_factor, 64*widen_factor]
-        assert((depth - 4) % 6 == 0)
+        self.widen_factor = widen_factor
+        self.depth = depth
+        self.drop_rate = drop_rate
+        channels = [16, 16 * widen_factor, 32 * widen_factor, 64 * widen_factor]
+        assert ((depth - 4) % 6 == 0)
         n = (depth - 4) / 6
         block = BasicBlock
         # 1st conv before any network block
@@ -105,21 +108,30 @@ class WideResNet(nn.Module):
             elif isinstance(m, nn.Linear):
                 nn.init.xavier_normal_(m.weight)
                 nn.init.constant_(m.bias, 0.0)
+        self.expose = expose
 
     def forward(self, x):
         out = self.conv1(x)
-        out = self.block1(out)
-        out = self.block2(out)
+        e1 = self.block1(out)
+        out = self.block2(e1)
         out = self.block3(out)
-        out = self.relu(self.bn1(out))
-        out = F.adaptive_avg_pool2d(out, 1)
-        out = out.view(-1, self.channels)
-        return self.fc(out)
+        e2 = self.relu(self.bn1(out))
+        out = F.adaptive_avg_pool2d(e2, 1)
+        e3 = out.view(-1, self.channels)
+        if not self.expose:
+            return self.fc(e3)
+        elif self.expose == 1:
+            return self.fc(e3), e3
+        elif self.expose == 2:
+            return self.fc(e3), e1, e3
+        else:
+            raise NotImplementedError
 
 
-def build_wideresnet(depth, widen_factor, dropout, num_classes):
+def build_wideresnet(depth, widen_factor, dropout, num_classes, expose):
     logger.info(f"Model: WideResNet {depth}x{widen_factor}")
     return WideResNet(depth=depth,
                       widen_factor=widen_factor,
                       drop_rate=dropout,
-                      num_classes=num_classes)
+                      num_classes=num_classes,
+                      expose=expose)

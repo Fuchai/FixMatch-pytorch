@@ -8,8 +8,8 @@ from collections import OrderedDict
 from copy import deepcopy
 
 import numpy as np
+import torch.backends.cudnn as cudnn
 import torch.optim as optim
-from torch.backends import cudnn
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -20,6 +20,10 @@ from fixmatch.dataset.cifar import get_cifar10, get_cifar100
 from fixmatch.models.confucius_model import *
 from fixmatch.utils import AverageMeter, accuracy
 from logger import Logger
+from slurm_manager import ExperimentManager
+
+DATASET_GETTERS = {'cifar10': get_cifar10,
+                   'cifar100': get_cifar100}
 
 
 def save_checkpoint(state, is_best, checkpoint, filename='checkpoint.pth.tar'):
@@ -60,7 +64,7 @@ def main():
     parser.add_argument('--version', default='0', type=str)
     parser.add_argument('--gpu-id', default='0', type=int,
                         help='id(s) for CUDA_VISIBLE_DEVICES')
-    parser.add_argument('--num-workers', type=int, default=32,
+    parser.add_argument('--num-workers', type=int, default=8,
                         help='number of workers')
     parser.add_argument('--dataset', default='cifar10', type=str,
                         choices=['cifar10', 'cifar100'],
@@ -74,8 +78,7 @@ def main():
                         help='number of total epochs to run')
     parser.add_argument('--start-epoch', default=0, type=int,
                         help='manual epoch number (useful on restarts)')
-    # is this per gpu batch_size? I do not seee data distributed across all 4 cards, guessing from the memory
-    parser.add_argument('--batch-size', default=512, type=int,
+    parser.add_argument('--batch-size', default=256, type=int,
                         help='train batchsize')
     parser.add_argument('--lr', '--learning-rate', default=0.03, type=float,
                         help='initial learning rate')
@@ -93,10 +96,14 @@ def main():
                         help='coefficient of unlabeled batch size')
     parser.add_argument('--lambda-u', default=1, type=float,
                         help='coefficient of unlabeled loss')
-    parser.add_argument('--threshold', default=0.98, type=float,
+    parser.add_argument('--threshold', default=0.95, type=float,
+                        help='pseudo label threshold')
+    parser.add_argument('--conf_threshold', default=0.99, type=float,
                         help='pseudo label threshold')
     parser.add_argument('--k-img', default=65536, type=int,
                         help='number of labeled examples')
+    # parser.add_argument('--out', default=str(logger.exp_dir / 'result'),
+    #                     help='directory to output the result')
     parser.add_argument('--resume', default='', type=str,
                         help='path to latest checkpoint (default: none)')
     parser.add_argument('--seed', type=int, default=-1,
@@ -112,12 +119,12 @@ def main():
                         help="don't use progress bar")
     parser.add_argument('--no-semi-confucius', action='store_true',
                         help="train confucius with unlabelled data")
+    parser.add_argument('--expose', default=2, help="control level of confucius expose")
 
     args = parser.parse_args()
     best_acc = 0
     logger = Logger(args.set, args.version)
     args.out = str(logger.exp_dir / 'result')
-    args.semi_confucius=not args.no_semi_confucius
 
     def create_model(args):
         if args.arch == 'wideresnet':
@@ -126,7 +133,7 @@ def main():
                                             widen_factor=args.model_width,
                                             dropout=0,
                                             num_classes=args.num_classes,
-                                            expose=True)
+                                            expose=args.expose)
         elif args.arch == 'resnext':
             import models.resnext as models
             model = models.build_resnext(cardinality=args.model_cardinality,
@@ -191,9 +198,6 @@ def main():
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
 
-    DATASET_GETTERS = {'cifar10': get_cifar10,
-                       'cifar100': get_cifar100}
-
     labeled_dataset, unlabeled_dataset, test_dataset = DATASET_GETTERS[args.dataset](
         '../../data/cifarfm', args.num_labeled, args.k_img, args.k_img * args.mu)
 
@@ -204,7 +208,12 @@ def main():
 
     model.to(args.device)
 
-    confucius = Confucius(10, 128, 32)
+    if args.expose == 1:
+        confucius = Confucius(10, 128, 32)
+    elif args.expose == 2:
+        confucius = WideResConfucius(model)
+    else:
+        raise Exception()
     confucius.to(args.device)
 
     train_sampler = RandomSampler if args.local_rank == -1 else DistributedSampler
@@ -303,7 +312,19 @@ def main():
 
         test_loss, test_acc, test_acc_5 = ttest(args, test_loader, test_model, 0, logger)
 
-
+        # if args.local_rank in [-1, 0]:
+        #     logger.auto_log("train loss", epoch=epoch, iter=len(labeled_trainloader),
+        #                     loss=train_loss, loss_x=train_loss_x,
+        #                     loss_u=train_loss_u, mask_prob=mask_prob, epoch_time=epoch_time)
+        #     logger.auto_log("test loss", epoch=epoch,
+        #                     accu=test_acc, loss=test_loss)
+        #
+        # writer.add_scalar('train/1.train_loss', train_loss, epoch)
+        # writer.add_scalar('train/2.train_loss_x', train_loss_x, epoch)
+        # writer.add_scalar('train/3.train_loss_u', train_loss_u, epoch)
+        # writer.add_scalar('train/4.mask', mask_prob, epoch)
+        # writer.add_scalar('test/1.test_acc', test_acc, epoch)
+        # writer.add_scalar('test/2.test_loss', test_loss, epoch)
 
         is_best = test_acc > best_acc
         best_acc = max(test_acc, best_acc)
@@ -313,7 +334,7 @@ def main():
                 ema_to_save = ema_model.ema.module if hasattr(
                     ema_model.ema, "module") else ema_model.ema
             save_checkpoint({
-                'epoch': epoch,
+                'epoch': epoch + 1,
                 'state_dict': model_to_save.state_dict(),
                 'ema_state_dict': ema_to_save.state_dict() if args.use_ema else None,
                 'acc': test_acc,
@@ -330,6 +351,9 @@ def main():
             logger.writer.add_scalar('test/1.test_acc', float(test_acc), epoch)
             logger.writer.add_scalar('test/2.test_loss', float(test_loss), epoch)
 
+        # test_accs.append(test_acc)
+        # logger.auto_log("test accuracy", epoch=epoch, best_top_1=best_acc,
+        #                 mean_top_1=np.mean(test_accs[-20:]))
 
     if args.local_rank in [-1, 0]:
         logger.writer.close()
@@ -347,8 +371,6 @@ def train_one_epoch(args, labeled_trainloader, unlabeled_trainloader,
     avg_mask = AverageMeter()
     avg_mask_conf = AverageMeter()
     avg_conf_loss = AverageMeter()
-
-
     avg_true_confidence, avg_false_confidence, avg_true_semi_confidence, avg_false_semi_confidence = \
         AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter()
 
@@ -368,8 +390,12 @@ def train_one_epoch(args, labeled_trainloader, unlabeled_trainloader,
         batch_size = inputs_x.shape[0]
         inputs = torch.cat((inputs_x, inputs_u_w, inputs_u_s)).to(args.device)
         targets_x = targets_x.to(args.device)
-        logits, exposed = model(inputs)
-        confidence_logits = confucius(logits.detach(), exposed.detach())
+        if args.expose ==2:
+            logits, e1, e3 = model(inputs)
+            confidence_logits = confucius(logits.detach(), e1.detach(), e3.detach())
+        else:
+            logits, e = model(inputs)
+            confidence_logits = confucius(logits.detach(), e.detach())
         conf_logits_x = confidence_logits[:batch_size]
         uconf = confidence_logits[batch_size:]
         conf_logits_u_w, conf_logits_u_s = uconf.chunk(2)
@@ -387,9 +413,9 @@ def train_one_epoch(args, labeled_trainloader, unlabeled_trainloader,
         max_probs, pseudo_label = torch.max(pseudo_label, dim=-1)
         # use confidence instead to mask the pseudo-label below threshold
         # I'm guessing that the mask does not have gradient, the masked has
-        mask = conf_u_w.ge(args.threshold).float()
+        mask = conf_u_w.ge(args.conf_threshold).float()
         # mask = max_probs.ge(args.threshold).float()
-
+        avg_mask_conf.update(conf_u_w.mean().item())
         Lu = (F.cross_entropy(logits_u_s, pseudo_label,
                               reduction='none') * mask).mean()
 
@@ -417,36 +443,45 @@ def train_one_epoch(args, labeled_trainloader, unlabeled_trainloader,
         # I'm guessing that the
         confucius.zero_grad()
 
-        # main model finishes, start confidence model
+        ################# main model finishes, start confidence model ################
         # generate label for confucius, we use precision as usual
         # labelled prediction
-        # TODO debug this
-        # TODO question, should only labelled data be used to train confidence or should strongly augmented as well?
-        # TODO the main model is trained with augmented, so should confidence do the same? I'm not sure
-        pred = torch.softmax(logits_x.detach(), dim=-1)
-        pred = pred.argmax(dim=1, keepdim=True)
-        precision = pred.eq(targets_x.view_as(pred)).float()
+        x_pred = torch.softmax(logits_x.detach(), dim=-1)
+        x_pred_prob, x_pred = x_pred.max(dim=1, keepdim=True)
+        # TODO high bar prediction
+        # the label: x_pred needs to be correct
+        # x_pred_prob also needs to be more than 0.5
+        x_accu = x_pred.eq(targets_x.view_as(x_pred))
+        x_semi_target=x_pred_prob.ge(args.threshold)*x_accu
+        true_confidence = (conf_x * x_semi_target).mean().item()
+        false_confidence = (conf_x * ~x_semi_target).mean().item()
 
-        x_conf_loss = F.binary_cross_entropy_with_logits(conf_logits_x, precision)
+        x_conf_loss = F.binary_cross_entropy_with_logits(conf_logits_x, x_semi_target.float())
 
         if args.no_semi_confucius:
             u_s_conf_loss = 0
         else:
+            # will the model predict the strongly augmented labels correctly as well?
             u_s_pred = torch.softmax(logits_u_s.detach(), dim=-1)
-            u_s_pred = u_s_pred.argmax(dim=1, keepdim=True)
-            u_s_accu = u_s_pred.eq(pseudo_label.view_as(u_s_pred)).float()
-            u_s_conf_loss = F.binary_cross_entropy_with_logits(
-                conf_u_s, u_s_accu)
+            u_s_pred_prob, u_s_pred = u_s_pred.max(dim=1, keepdim=True)
+            u_s_accu = u_s_pred.eq(pseudo_label.view_as(u_s_pred))
+            u_s_semi_target = u_s_pred_prob.ge(args.threshold)*u_s_accu
+            if mask.sum()==0:
+                true_semi_confidence, false_semi_confidence=0,0
+            else:
+                true_semi_confidence = (((u_s_semi_target * conf_u_s) * mask).sum() / mask.sum()).item()
+                false_semi_confidence = (((~u_s_semi_target * conf_u_s) * mask).sum() / mask.sum()).item()
+            u_s_conf_loss = (F.binary_cross_entropy_with_logits(
+                conf_u_s, u_s_semi_target.float(), reduction="none") * mask).mean()
 
         conf_loss = x_conf_loss + args.lambda_u * u_s_conf_loss
 
         conf_loss.backward()
-
         avg_conf_loss.update(conf_loss.item())
-        avg_true_confidence.update(0)
-        avg_false_confidence.update(0)
-        avg_true_semi_confidence.update(0)
-        avg_false_semi_confidence.update(0)
+        avg_true_confidence.update(true_confidence)
+        avg_false_confidence.update(false_confidence)
+        avg_true_semi_confidence.update(true_semi_confidence)
+        avg_false_semi_confidence.update(false_semi_confidence)
 
         confucius_optim.step()
         model.zero_grad()
@@ -465,30 +500,17 @@ def train_one_epoch(args, labeled_trainloader, unlabeled_trainloader,
                 f"Conf loss:{avg_conf_loss:.4f}. True labelled confidence: {avg_true_confidence:4f}. "
                 f"False labelled confidence: {avg_false_confidence:.4f}. True semi confidence: {avg_true_semi_confidence:4.f}."
                 f"False semi confidence: {avg_false_semi_confidence:.4f}.")
-            # .format(
-            # epoch=epoch + 1,
-            # epochs=args.epochs,
-            # batch=batch_idx + 1,
-            # iter=args.iteration,
-            # lr=scheduler.get_last_lr()[0],
-            # data=data_time,
-            # bt=batch_time,
-            # loss=losses,
-            # loss_x=losses_x,
-            # loss_u=losses_u,
-            # mask=mask_prob))
             p_bar.update()
         else:
             print_intvl = int(len(labeled_trainloader) / 10)
-            if batch_idx % print_intvl == 0 or batch_idx == len(labeled_trainloader)-1:
+            if batch_idx % print_intvl == 0 or batch_idx == len(labeled_trainloader) - 1:
                 logger.auto_log("train", tensorboard=True, epoch=epoch, iter=batch_idx,
                                 loss=losses, loss_x=losses_x,
-                                loss_u=losses_u, mask_prob=avg_mask, epoch_time=time.time() - epoch_start,
+                                loss_u=losses_u, mask_prob=avg_mask,
                                 mask_conf=avg_mask_conf, conf_loss=avg_conf_loss,
                                 true_confidence=avg_true_confidence,
-                                false_confidence=avg_false_confidence, true_semi_conf=0,
-                                false_semi_conf =0)
-
+                                false_confidence=avg_false_confidence, true_semi_conf=avg_true_semi_confidence,
+                                false_semi_conf=avg_false_semi_confidence)
     if not args.no_progress:
         p_bar.close()
 
@@ -520,7 +542,10 @@ def ttest(args, test_loader, model, epoch, logger):
 
             inputs = inputs.to(args.device)
             targets = targets.to(args.device)
-            outputs, _ = model(inputs)
+            if args.expose == 2:
+                outputs, _, _ = model(inputs)
+            else:
+                outputs, _ = model(inputs)
             loss = F.cross_entropy(outputs, targets)
 
             prec1, prec5 = accuracy(outputs, targets, topk=(1, 5))
@@ -543,7 +568,12 @@ def ttest(args, test_loader, model, epoch, logger):
                     ))
         if not args.no_progress:
             test_loader.close()
+    # logger.auto_log("top accuracy", epoch=epoch,
+    #                 top_1_accu=top1.avg, top_5_acc=top5.avg)
+    # logger.log_print("top-1 acc: {:.2f}".format(top1.avg))
+    # logger.log_print("top-5 acc: {:.2f}".format(top5.avg))
     return losses.avg, top1.avg, top5.avg
+
 
 class ModelEMA(object):
     def __init__(self, args, model, decay, device='', resume=''):
@@ -587,7 +617,6 @@ class ModelEMA(object):
                 # weight decay
                 if 'bn' not in k:
                     msd[k] = msd[k] * (1. - self.wd)
-
 
 if __name__ == '__main__':
     cudnn.benchmark = True

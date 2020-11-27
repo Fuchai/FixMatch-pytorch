@@ -62,3 +62,6 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+    def __float__(self):
+        return self.avg
